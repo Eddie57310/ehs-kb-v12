@@ -722,11 +722,14 @@ def _list_kb_dir(path_hint: str = "") -> str:
     return "\n".join(lines)
 
 
-def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, prompt: str, answer: str):
-    """每次问答后写详细日志，用于检查检索质量和 LLM 输入输出。"""
+def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, prompt: str, answer: str, asker: str = ""):
+    """每次问答后写详细日志，用于检查检索质量和 LLM 输入输出。
+    asker（提问人姓名/open_id）若有则写进文件名，便于一眼看出是谁问的。"""
     ts = time.strftime('%Y%m%d_%H%M%S')
     safe_q = re.sub(r'[\\/:*?"<>|\s]', '_', question[:30]).strip('_')
-    log_path = os.path.join(QA_LOG_DIR, f"{ts}_{safe_q}.log")
+    safe_asker = re.sub(r'[\\/:*?"<>|\s]', '_', (asker or "").strip())[:20].strip('_')
+    name_part = f"{safe_asker}_" if safe_asker else ""
+    log_path = os.path.join(QA_LOG_DIR, f"{ts}_{name_part}{safe_q}.log")
 
     lines = [
         "=" * 60,
@@ -783,10 +786,11 @@ def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, p
         logger.warning(f"QA日志写入失败: {e}")
 
 
-def answer_for(question):
+def answer_for(question, asker=""):
     """平台无关核心：输入问题，返回 (答案文本, 图片路径列表)。
     命令与目录查询也在此处理，统一返回纯文本。具体平台的回复由调用方负责，
-    使得飞书 / 企业微信等多入口能复用同一套检索+LLM 大脑。"""
+    使得飞书 / 企业微信等多入口能复用同一套检索+LLM 大脑。
+    asker（提问人姓名/id）仅用于写进 qa_logs 文件名，便于审计辨认。"""
     global CURRENT_LLM, CURRENT_MODEL
     cmd = question.strip()
     
@@ -1174,7 +1178,7 @@ def answer_for(question):
         answer = f"❌ 响应失败: {str(e)}"
 
     answer = clean_for_feishu(answer)
-    write_qa_log(question, docs_and_scores, valid_with_scores, user_prompt, answer)
+    write_qa_log(question, docs_and_scores, valid_with_scores, user_prompt, answer, asker=asker)
     return (answer, [])
 
 # ================= 私聊白名单 + 用户名查询 + 全量问答记录 =================
@@ -1270,7 +1274,7 @@ def _safe_process(message_id, question, open_id, chat_id=None, chat_type=""):
                 pass
             return
         try:
-            text, images = answer_for(question)
+            text, images = answer_for(question, asker=name)
             log_qa_record(open_id, name, question, text, True, chat_type)
             reply_feishu_with_images(message_id, text, images, chat_id=chat_id)
         except Exception:
