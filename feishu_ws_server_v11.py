@@ -1233,12 +1233,13 @@ def get_user_name(open_id: str) -> str:
         _name_cache[open_id] = name
     return name
 
-def log_qa_record(open_id: str, name: str, question: str, answer: str, authorized: bool):
-    """全量问答审计：每条一行 JSON（含 id/昵称/时间/问题/答案/是否授权），按月分文件，便于导出。"""
+def log_qa_record(open_id: str, name: str, question: str, answer: str, authorized: bool, chat_type: str = ""):
+    """全量问答审计：每条一行 JSON（含 id/昵称/时间/场景/问题/答案/是否授权），按月分文件，便于导出。"""
     rec = {
         "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "open_id": open_id,
         "name": name,
+        "chat": chat_type,          # p2p=私聊  group=群
         "authorized": authorized,
         "question": question,
         "answer": answer,
@@ -1251,14 +1252,14 @@ def log_qa_record(open_id: str, name: str, question: str, answer: str, authorize
         logger.warning(f"⚠️ 问答记录写入失败: {e}")
 
 
-def _safe_process(message_id, question, open_id, chat_id=None):
-    """飞书私聊线程入口：白名单鉴权 → answer_for → 回复，并全量记录问答。"""
+def _safe_process(message_id, question, open_id, chat_id=None, chat_type=""):
+    """飞书线程入口（私聊 + 内部群）：白名单鉴权 → answer_for → 回复，并全量记录问答。"""
     with _worker_sem:
         name = get_user_name(open_id)
-        # ── 授权白名单：仅名单内 open_id 放行，否则拒答并记录 ──
+        # ── 授权白名单：仅名单内 open_id 放行，否则拒答并记录（allow_all=true 时全放行）──
         if not is_authorized(open_id):
             logger.warning(f"⛔ 未授权 open_id={open_id} ({name}) 提问被拒：{question[:40]}")
-            log_qa_record(open_id, name, question, "[未授权，已拒绝]", False)
+            log_qa_record(open_id, name, question, "[未授权，已拒绝]", False, chat_type)
             try:
                 reply_feishu_message(message_id,
                     f"🔒 您暂无权限使用本知识库，请联系管理员开通。\n（您的用户ID：{open_id}，请提供给管理员）")
@@ -1267,11 +1268,11 @@ def _safe_process(message_id, question, open_id, chat_id=None):
             return
         try:
             text, images = answer_for(question)
-            log_qa_record(open_id, name, question, text, True)
+            log_qa_record(open_id, name, question, text, True, chat_type)
             reply_feishu_with_images(message_id, text, images, chat_id=chat_id)
         except Exception:
             logger.exception("❌ answer_for 未捕获异常")
-            log_qa_record(open_id, name, question, "[系统异常]", True)
+            log_qa_record(open_id, name, question, "[系统异常]", True, chat_type)
             try:
                 reply_feishu_message(message_id, "❌ 系统处理异常，请稍后重试；若持续出现请联系管理员查看日志。")
             except Exception:
@@ -1304,11 +1305,8 @@ def handle_feishu_message(data: P2ImMessageReceiveV1) -> None:
         logger.info(f"  ↩️ 重复事件，已处理过，忽略: {event.message.message_id}")
         return
 
-    # ── 只服务私聊（p2p）：群消息一律不答，从源头杜绝群内（含组织外用户）外泄 ──
-    if chat_type != "p2p":
-        logger.info(f"  🚫 非私聊消息（chat_type={chat_type}），不予回答")
-        return
-
+    # ── 私聊 + 内部群都答（群内外泄已由「内部群 + 禁止加到外部群」从结构上堵住）──
+    # 群里只有 @ 机器人的消息才会被推送（im:message.group_at_msg:readonly），无需再判 @。
     # 发消息人的 open_id（白名单鉴权 + 全量记录用）
     try:
         open_id = event.sender.sender_id.open_id or ""
@@ -1331,7 +1329,8 @@ def handle_feishu_message(data: P2ImMessageReceiveV1) -> None:
         return
     logger.info(f"  处理问题: {user_question_clean[:80]}")
     threading.Thread(target=_safe_process,
-                     args=(event.message.message_id, user_question, open_id, event.message.chat_id)).start()
+                     args=(event.message.message_id, user_question, open_id,
+                           event.message.chat_id, chat_type)).start()
 
 if __name__ == "__main__":
     event_handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_feishu_message).build()
