@@ -16,8 +16,12 @@ LOG_DIR    = f"{BASE_DIR}/logs"
 QA_LOG_DIR = f"{BASE_DIR}/qa_logs"
 KB_DIR     = f"{BASE_DIR}/Local_KB"
 
+WHITELIST_FILE = f"{BASE_DIR}/authorized_users.json"
+QA_RECORD_DIR  = f"{BASE_DIR}/qa_records"
+
 os.makedirs(LOG_DIR,    exist_ok=True)
 os.makedirs(QA_LOG_DIR, exist_ok=True)
+os.makedirs(QA_RECORD_DIR, exist_ok=True)
 current_date = datetime.now().strftime('%Y-%m-%d')
 log_file = os.path.join(LOG_DIR, f"feishu_ws_server_v11_{current_date}.log")
 
@@ -1173,15 +1177,101 @@ def answer_for(question):
     write_qa_log(question, docs_and_scores, valid_with_scores, user_prompt, answer)
     return (answer, [])
 
-def _safe_process(message_id, question, chat_id=None):
-    """飞书线程入口：限并发 + 整体兜底。检索/聚合等任一环节崩溃（如 HNSW 损坏）
-    都不再静默吞掉，用户至少能收到一条错误提示。"""
+# ================= 私聊白名单 + 用户名查询 + 全量问答记录 =================
+_wl = {"users": set(), "open": False, "mtime": -1}
+_wl_lock = threading.Lock()
+
+def _load_whitelist():
+    with _wl_lock:
+        try:
+            if not os.path.exists(WHITELIST_FILE):
+                _wl["users"], _wl["open"], _wl["mtime"] = set(), False, 0
+                return
+            mtime = os.path.getmtime(WHITELIST_FILE)
+            if mtime == _wl["mtime"]:
+                return
+            with open(WHITELIST_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            _wl["users"] = set(data.get("feishu_authorized_open_ids", []))
+            _wl["open"]  = bool(data.get("allow_all", False))   # 应急临时全放行
+            _wl["mtime"] = mtime
+            logger.info(f"🔐 飞书白名单已加载: {len(_wl['users'])} 人 allow_all={_wl['open']}")
+        except Exception as e:
+            logger.error(f"⚠️ 白名单加载失败，按全部拒绝处理: {e}")
+            _wl["users"], _wl["open"] = set(), False
+
+def is_authorized(open_id: str) -> bool:
+    _load_whitelist()
+    with _wl_lock:
+        return _wl["open"] or open_id in _wl["users"]
+
+_name_cache = {}
+_name_lock = threading.Lock()
+
+def get_user_name(open_id: str) -> str:
+    """用 open_id 查飞书昵称（需通讯录权限 contact:user.base:readonly）；查不到回退 open_id。"""
+    if not open_id:
+        return ""
+    with _name_lock:
+        if open_id in _name_cache:
+            return _name_cache[open_id]
+    name = ""
+    token = get_tenant_access_token()
+    if token:
+        try:
+            r = requests.get(f"https://open.feishu.cn/open-apis/contact/v3/users/{open_id}",
+                             headers={"Authorization": f"Bearer {token}"},
+                             params={"user_id_type": "open_id"}, timeout=10).json()
+            if r.get("code") == 0:
+                name = r.get("data", {}).get("user", {}).get("name", "")
+            else:
+                logger.info(f"  查询用户名返回 code={r.get('code')}（可能未开通通讯录权限）")
+        except Exception as e:
+            logger.warning(f"⚠️ 查询用户名异常: {e}")
+    name = name or open_id
+    with _name_lock:
+        _name_cache[open_id] = name
+    return name
+
+def log_qa_record(open_id: str, name: str, question: str, answer: str, authorized: bool):
+    """全量问答审计：每条一行 JSON（含 id/昵称/时间/问题/答案/是否授权），按月分文件，便于导出。"""
+    rec = {
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "open_id": open_id,
+        "name": name,
+        "authorized": authorized,
+        "question": question,
+        "answer": answer,
+    }
+    path = os.path.join(QA_RECORD_DIR, f"qa_records_{datetime.now().strftime('%Y-%m')}.jsonl")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"⚠️ 问答记录写入失败: {e}")
+
+
+def _safe_process(message_id, question, open_id, chat_id=None):
+    """飞书私聊线程入口：白名单鉴权 → answer_for → 回复，并全量记录问答。"""
     with _worker_sem:
+        name = get_user_name(open_id)
+        # ── 授权白名单：仅名单内 open_id 放行，否则拒答并记录 ──
+        if not is_authorized(open_id):
+            logger.warning(f"⛔ 未授权 open_id={open_id} ({name}) 提问被拒：{question[:40]}")
+            log_qa_record(open_id, name, question, "[未授权，已拒绝]", False)
+            try:
+                reply_feishu_message(message_id,
+                    f"🔒 您暂无权限使用本知识库，请联系管理员开通。\n（您的用户ID：{open_id}，请提供给管理员）")
+            except Exception:
+                pass
+            return
         try:
             text, images = answer_for(question)
+            log_qa_record(open_id, name, question, text, True)
             reply_feishu_with_images(message_id, text, images, chat_id=chat_id)
         except Exception:
             logger.exception("❌ answer_for 未捕获异常")
+            log_qa_record(open_id, name, question, "[系统异常]", True)
             try:
                 reply_feishu_message(message_id, "❌ 系统处理异常，请稍后重试；若持续出现请联系管理员查看日志。")
             except Exception:
@@ -1207,11 +1297,23 @@ def _extract_post_text(content_json: str) -> str:
 def handle_feishu_message(data: P2ImMessageReceiveV1) -> None:
     event = data.event
     msg_type = event.message.message_type
-    logger.info(f"📨 收到飞书消息 type={msg_type} id={event.message.message_id}")
+    chat_type = getattr(event.message, "chat_type", "") or ""
+    logger.info(f"📨 收到飞书消息 type={msg_type} chat={chat_type} id={event.message.message_id}")
 
     if _is_duplicate_msg(event.message.message_id):
         logger.info(f"  ↩️ 重复事件，已处理过，忽略: {event.message.message_id}")
         return
+
+    # ── 只服务私聊（p2p）：群消息一律不答，从源头杜绝群内（含组织外用户）外泄 ──
+    if chat_type != "p2p":
+        logger.info(f"  🚫 非私聊消息（chat_type={chat_type}），不予回答")
+        return
+
+    # 发消息人的 open_id（白名单鉴权 + 全量记录用）
+    try:
+        open_id = event.sender.sender_id.open_id or ""
+    except Exception:
+        open_id = ""
 
     if msg_type == "text":
         user_question = json.loads(event.message.content).get("text", "")
@@ -1228,7 +1330,8 @@ def handle_feishu_message(data: P2ImMessageReceiveV1) -> None:
         logger.info(f"  消息被过滤（空/表情/过短）: {repr(user_question)}")
         return
     logger.info(f"  处理问题: {user_question_clean[:80]}")
-    threading.Thread(target=_safe_process, args=(event.message.message_id, user_question, event.message.chat_id)).start()
+    threading.Thread(target=_safe_process,
+                     args=(event.message.message_id, user_question, open_id, event.message.chat_id)).start()
 
 if __name__ == "__main__":
     event_handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(handle_feishu_message).build()

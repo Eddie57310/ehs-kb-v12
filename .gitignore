@@ -69,3 +69,6 @@ wecom_run.log
 
 # 授权白名单（含成员 userid，人员数据不入库）
 authorized_users.json
+
+# 全量问答审计记录（含人员id/昵称，人员数据不入库）
+qa_records/
