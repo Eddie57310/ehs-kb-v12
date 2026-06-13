@@ -12,7 +12,7 @@ from pathlib import Path
 # ── 复用飞书机器人的核心组件 ──
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from feishu_ws_server_v11 import (
+from feishu_ws_server_v12 import (
     db, call_llm_engine, _SYSTEM_PROMPT, _SYSTEM_PROMPT_ACCIDENT, _ACCIDENT_LEGAL_QUERIES,
     _CROP_TAG_RE, BASE_DIR, KB_DIR, QA_LOG_DIR,
     _detect_dir_query, _list_kb_dir,

@@ -23,7 +23,7 @@ os.makedirs(LOG_DIR,    exist_ok=True)
 os.makedirs(QA_LOG_DIR, exist_ok=True)
 os.makedirs(QA_RECORD_DIR, exist_ok=True)
 current_date = datetime.now().strftime('%Y-%m-%d')
-log_file = os.path.join(LOG_DIR, f"feishu_ws_server_v11_{current_date}.log")
+log_file = os.path.join(LOG_DIR, f"feishu_ws_server_v12_{current_date}.log")
 
 logging.basicConfig(
     level=logging.INFO,

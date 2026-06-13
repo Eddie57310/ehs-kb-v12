@@ -2,7 +2,7 @@
 企业微信自建应用入口（v12）
 ====================================
 设计要点：
-  • 复用 feishu_ws_server_v11.answer_for —— 同一套混合检索 + Rerank + 豆包大脑，
+  • 复用 feishu_ws_server_v12.answer_for —— 同一套混合检索 + Rerank + 豆包大脑，
     只在 I/O 层换成企业微信的回调/推送，不重复加载模型（只跑本服务时不连飞书）。
   • 回调 5 秒限制：收到消息立即 ACK 空串，后台线程算完答案再用
     「发送应用消息」API 主动推回给该成员（自建应用可随时推，无 48h 窗口限制）。
@@ -29,7 +29,7 @@ import uvicorn
 from Crypto.Cipher import AES
 
 # 复用飞书服务里的平台无关大脑（导入即完成 embedding/BM25/reranker 初始化，但不启动飞书 WS）
-import feishu_ws_server_v11 as brain
+import feishu_ws_server_v12 as brain
 
 # ================= 配置 =================
 BASE_DIR   = os.path.expanduser("~/doc_parser_v12")
