@@ -1209,7 +1209,7 @@ _name_cache = {}
 _name_lock = threading.Lock()
 
 def get_user_name(open_id: str) -> str:
-    """用 open_id 查飞书昵称（需通讯录权限 contact:user.base:readonly）；查不到回退 open_id。"""
+    """用 open_id 查飞书昵称（需 contact:user.basic_profile:readonly + contact:user.base:readonly）；查不到回退 open_id。"""
     if not open_id:
         return ""
     with _name_lock:
@@ -1225,13 +1225,16 @@ def get_user_name(open_id: str) -> str:
             if r.get("code") == 0:
                 name = r.get("data", {}).get("user", {}).get("name", "")
             else:
-                logger.info(f"  查询用户名返回 code={r.get('code')}（可能未开通通讯录权限）")
+                logger.info(f"  查询用户名返回 code={r.get('code')} msg={r.get('msg')}（可能未开通 contact:user.basic_profile:readonly / contact:user.base:readonly）")
         except Exception as e:
             logger.warning(f"⚠️ 查询用户名异常: {e}")
-    name = name or open_id
-    with _name_lock:
-        _name_cache[open_id] = name
-    return name
+    # 只缓存查到的真名；没查到就回退 open_id 但【不缓存】，下次重试
+    # （否则开通通讯录权限后，之前问过的人仍会一直显示 open_id）
+    if name:
+        with _name_lock:
+            _name_cache[open_id] = name
+        return name
+    return open_id
 
 def log_qa_record(open_id: str, name: str, question: str, answer: str, authorized: bool, chat_type: str = ""):
     """全量问答审计：每条一行 JSON（含 id/昵称/时间/场景/问题/答案/是否授权），按月分文件，便于导出。"""
