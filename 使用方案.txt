@@ -1,0 +1,21 @@
+进入环境的命令
+
+  cd ~/doc_parser_v11
+  source venv/bin/activate
+
+  激活后命令行前面会出现 (venv)。之后直接 python xxx.py 即可；不激活也行，用
+  venv/bin/python xxx.py 前缀同效。
+
+  工管部新文件的完整跑法（4 步，别跳）
+
+  # 1) 解析成 Markdown（增量，已解析的自动 skip，只会处理工管部新文件）
+  venv/bin/python rebuild_md.py
+
+  # 2) 启动 MD 人工审核，浏览器开 8084，校核 + 插图 + 删目录索引
+  venv/bin/python md_reviewer.py
+
+  # 3) 校核完成后，入库
+  venv/bin/python index_reviewed_md.py
+
+  rebuild_md.py 跑整个 Local_KB/，但有增量逻辑（if os.path.exists(out_path): 
+  skip），所以已入库的旧 domain 不会重跑，只解析工管部这批新文件，安全。

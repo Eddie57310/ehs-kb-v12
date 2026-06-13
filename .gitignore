@@ -1,0 +1,65 @@
+# 密钥文件（绝不提交）
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.bak
+
+# 虚拟环境（体积巨大，用 requirements.txt 重建）
+venv/
+.venv/
+
+# 向量数据库（本地生成，不入库）
+nano_chroma_db/
+chroma_db/
+
+# SQLite 数据库（本地运行时数据）
+relation_db.sqlite
+*.sqlite
+
+# 知识库源文件（用户数据，不公开）
+Local_KB/
+
+# MD 审核中间层（用户数据）
+reviewed_md/
+archived_files/
+
+# 截图
+user_crops/
+slide_images/
+
+# BM25 索引（从 ChromaDB 自动生成，27MB 二进制，不入库）
+bm25_index.pkl
+bm25_index.pkl.tmp
+
+# ChromaDB 备份 / 损坏副本（本地数据，不入库）
+chroma_db.bak*/
+chroma_db.broken*/
+
+# 已删除 chunk 的存档（本地操作记录）
+deleted_chunks/
+
+# 知识库原文存档（用户数据，不公开）
+原文存档_*/
+
+# 运行时产物
+logs/
+qa_logs/
+feishu_run.log
+feishu.pid
+batch_output/
+Failed_PDFs/
+org_confirm/
+nohup.out
+
+# 临时 / 预览文件
+_positive_sample.json
+_preview_ehs.md
+
+# Claude Code 内部状态（不入库）
+.claude/
+
+# 系统文件
+.DS_Store

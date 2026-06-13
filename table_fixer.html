@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>MD 表格修复工具</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 20px; color: #333; font-size: 20px; }
+  .container { display: flex; gap: 16px; max-width: 1400px; margin: 0 auto; }
+  .panel { flex: 1; background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+  .panel h2 { font-size: 14px; color: #666; margin-bottom: 8px; }
+  textarea {
+    width: 100%; height: 320px; font-family: monospace; font-size: 13px;
+    border: 1px solid #ddd; border-radius: 4px; padding: 10px; resize: vertical;
+    line-height: 1.5;
+  }
+  .btn-row { display: flex; gap: 8px; margin: 12px 0; justify-content: center; }
+  button {
+    padding: 8px 20px; border: none; border-radius: 4px; cursor: pointer;
+    font-size: 14px; font-weight: 500;
+  }
+  .btn-main { background: #1677ff; color: white; }
+  .btn-main:hover { background: #0958d9; }
+  .btn-copy { background: #52c41a; color: white; }
+  .btn-copy:hover { background: #389e0d; }
+  .btn-clear { background: #ff4d4f; color: white; }
+  .btn-clear:hover { background: #cf1322; }
+  #output { width: 100%; height: 320px; font-family: monospace; font-size: 13px;
+    border: 1px solid #ddd; border-radius: 4px; padding: 10px; resize: vertical;
+    background: #fafafa; line-height: 1.5; }
+  #preview {
+    border: 1px solid #ddd; border-radius: 4px; padding: 12px;
+    min-height: 320px; overflow: auto; font-size: 14px; line-height: 1.6;
+  }
+  #preview table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  #preview th, #preview td {
+    border: 1px solid #d0d0d0; padding: 6px 12px; text-align: left;
+  }
+  #preview th { background: #f5f5f5; font-weight: 600; }
+  #preview tr:nth-child(even) td { background: #fafafa; }
+  .status { font-size: 12px; color: #888; text-align: center; margin-top: 6px; }
+  .tip { font-size: 12px; color: #aaa; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>MD 表格修复工具</h1>
+<div class="container">
+
+  <!-- 输入 -->
+  <div class="panel">
+    <h2>输入（粘贴原始文本 / 残缺表格）</h2>
+    <textarea id="input" placeholder="粘贴 MinerU 解析出的表格或原始文本，支持：
+- 管道符表格（可能缺空行、单元格内有换行）
+- 纯文字描述（会尝试自动识别列）
+- 混乱的多行合并单元格"></textarea>
+    <p class="tip">提示：也可以直接粘贴从 PDF 复制的表格文字</p>
+  </div>
+
+  <!-- 操作按钮 -->
+  <div style="display:flex;flex-direction:column;justify-content:center;gap:10px;min-width:100px;">
+    <button class="btn-main" onclick="convert()">▶ 修复转换</button>
+    <button class="btn-copy" onclick="copyOutput()">📋 复制结果</button>
+    <button class="btn-clear" onclick="clearAll()">🗑 清空</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <!-- 输出 -->
+  <div class="panel">
+    <h2>输出（标准 MD 表格）</h2>
+    <textarea id="output" readonly placeholder="修复后的 Markdown 表格将显示在这里..."></textarea>
+  </div>
+
+  <!-- 预览 -->
+  <div class="panel">
+    <h2>实时预览</h2>
+    <div id="preview"></div>
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+function convert() {
+  const raw = document.getElementById('input').value.trim();
+  if (!raw) { setStatus('请先粘贴内容'); return; }
+
+  let result = '';
+
+  // 判断是否包含管道符（pipe table）
+  if (raw.includes('|')) {
+    result = fixPipeTable(raw);
+  } else {
+    result = tryParseRawText(raw);
+  }
+
+  document.getElementById('output').value = result;
+  renderPreview(result);
+  setStatus('转换完成 ✓');
+}
+
+function fixPipeTable(text) {
+  const lines = text.split('\n');
+  const tableLines = [];
+
+  for (let line of lines) {
+    line = line.trim();
+    if (!line) continue;
+
+    // 判断是否是表格行
+    if (line.startsWith('|') || line.includes(' | ') || line.match(/^\|?[^|]+\|/)) {
+      // 清理：合并单元格内多余换行（通过合并连续非空行）
+      if (tableLines.length > 0) {
+        const last = tableLines[tableLines.length - 1];
+        // 如果上一行是表格行且当前行不像新行开头
+        if (last.startsWith('|') && !line.startsWith('|') && !line.match(/^[-:]+$/)) {
+          // 追加到上一行最后一个单元格
+          tableLines[tableLines.length - 1] = last.replace(/\|(\s*)$/, (m, s) => line + ' |');
+          continue;
+        }
+      }
+      tableLines.push(line);
+    } else if (tableLines.length > 0) {
+      // 非表格行但在表格中间，追加到上一单元格
+      const last = tableLines[tableLines.length - 1];
+      if (last.startsWith('|')) {
+        tableLines[tableLines.length - 1] = last.trimEnd().replace(/\|$/, '') + ' ' + line + ' |';
+        continue;
+      }
+    }
+  }
+
+  // 修正每行格式
+  const fixed = tableLines.map((line, i) => {
+    // 分隔行
+    if (line.match(/^\|?\s*[-:]+[\s|:-]*$/)) {
+      const cols = countCols(tableLines[0]);
+      return '|' + Array(cols).fill('---|').join('') ;
+    }
+    // 普通行：确保首尾有 |
+    let cells = splitCells(line);
+    return '| ' + cells.join(' | ') + ' |';
+  });
+
+  // 确保有分隔行
+  if (fixed.length >= 1 && !fixed[1]?.match(/^\|[-|: ]+\|$/)) {
+    const cols = countCols(fixed[0]);
+    fixed.splice(1, 0, '|' + Array(cols).fill('---|').join(''));
+  }
+
+  return '\n' + fixed.join('\n') + '\n';
+}
+
+function splitCells(line) {
+  // 去掉首尾的 |
+  let s = line.replace(/^\|/, '').replace(/\|$/, '');
+  return s.split('|').map(c => c.trim()).filter((c, i, arr) => i < arr.length);
+}
+
+function countCols(line) {
+  return splitCells(line).length;
+}
+
+function tryParseRawText(text) {
+  // 尝试把纯文本解析成表格（每行一个条目，tab 或多空格分隔）
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length === 0) return text;
+
+  const rows = lines.map(l => l.split(/\t|  +/).map(c => c.trim()).filter(Boolean));
+  const maxCols = Math.max(...rows.map(r => r.length));
+
+  const padRow = (row) => {
+    while (row.length < maxCols) row.push('');
+    return '| ' + row.join(' | ') + ' |';
+  };
+
+  const sep = '|' + Array(maxCols).fill('---|').join('');
+  const result = [padRow(rows[0]), sep, ...rows.slice(1).map(padRow)];
+  return '\n' + result.join('\n') + '\n';
+}
+
+function renderPreview(md) {
+  try {
+    document.getElementById('preview').innerHTML = marked.parse(md);
+  } catch(e) {
+    document.getElementById('preview').innerText = md;
+  }
+}
+
+function copyOutput() {
+  const out = document.getElementById('output').value;
+  if (!out) { setStatus('没有内容可复制'); return; }
+  navigator.clipboard.writeText(out).then(() => setStatus('已复制到剪贴板 ✓'));
+}
+
+function clearAll() {
+  document.getElementById('input').value = '';
+  document.getElementById('output').value = '';
+  document.getElementById('preview').innerHTML = '';
+  setStatus('');
+}
+
+function setStatus(msg) {
+  document.getElementById('status').innerText = msg;
+}
+
+// 输入实时预览（输出区）
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('output').addEventListener('input', function() {
+    renderPreview(this.value);
+  });
+});
+</script>
+</body>
+</html>
