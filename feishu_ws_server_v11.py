@@ -779,7 +779,10 @@ def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, p
         logger.warning(f"QA日志写入失败: {e}")
 
 
-def process_and_reply(message_id, question, chat_id=None):
+def answer_for(question):
+    """平台无关核心：输入问题，返回 (答案文本, 图片路径列表)。
+    命令与目录查询也在此处理，统一返回纯文本。具体平台的回复由调用方负责，
+    使得飞书 / 企业微信等多入口能复用同一套检索+LLM 大脑。"""
     global CURRENT_LLM, CURRENT_MODEL
     cmd = question.strip()
     
@@ -832,54 +835,44 @@ def process_and_reply(message_id, question, chat_id=None):
                 status_msg += "✅ 「近三年关于承包商安全管理有哪些新要求？宽松匹配 开启分析」\n"
                 status_msg += "✅ 「真实案例分析 ...案例描述文字...该如何界定责任？」"
 
-            reply_feishu_message(message_id, status_msg)
-            return
+            return (status_msg, [])
 
         # ── 隐藏暗号：切换模型 ──
         elif cmd == "/唤醒深度":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "cloud", "deepseek-v3.2"
-            reply_feishu_message(message_id, "🤫 已切换至火山引擎 DeepSeek-V3.2。")
-            return
+            return ("🤫 已切换至火山引擎 DeepSeek-V3.2。", [])
         elif cmd == "/唤醒火山":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "cloud", VOLCODING_MODEL
-            reply_feishu_message(message_id, f"🤫 已切换至火山引擎旗舰 ({VOLCODING_MODEL})。")
-            return
+            return (f"🤫 已切换至火山引擎旗舰 ({VOLCODING_MODEL})。", [])
         elif cmd == "/唤醒v4":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "cloud", "ark-code-latest"  # DeepSeek-V4-Pro-Beta
-            reply_feishu_message(message_id, "🤫 已切换至 DeepSeek-V4-Pro（尝鲜版，遇限流请切回 /唤醒火山）。")
-            return
+            return ("🤫 已切换至 DeepSeek-V4-Pro（尝鲜版，遇限流请切回 /唤醒火山）。", [])
         elif cmd == "/唤醒深海":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "local", "deepseek-r1:32b"
-            reply_feishu_message(message_id, "🤫 已切断云端，本地 DeepSeek-R1 32B 接管！")
-            return
+            return ("🤫 已切断云端，本地 DeepSeek-R1 32B 接管！", [])
         elif cmd == "/唤醒千问":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "local", "qwen2.5:32b"
-            reply_feishu_message(message_id, "🤫 已切断云端，本地 Qwen2.5 32B 接管！")
-            return
+            return ("🤫 已切断云端，本地 Qwen2.5 32B 接管！", [])
         elif cmd == "/唤醒极速":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "local", "qwen2.5:14b"
-            reply_feishu_message(message_id, "🤫 已切断云端，本地 Qwen2.5 14B 接管！")
-            return
+            return ("🤫 已切断云端，本地 Qwen2.5 14B 接管！", [])
         elif cmd.startswith("/目录"):
             path_hint = cmd[len("/目录"):].strip()
-            reply_feishu_message(message_id, _list_kb_dir(path_hint))
-            return
+            return (_list_kb_dir(path_hint), [])
         else:
-            reply_feishu_message(message_id, "⚠️ 未知指令。请输入 `/说明` 查看可用指令。")
-            return
+            return ("⚠️ 未知指令。请输入 `/说明` 查看可用指令。", [])
 
     # ── 目录查询意图：自然语言模糊匹配，不走 RAG ──
     _is_dir, _path = _detect_dir_query(question)
     if _is_dir:
         logger.info(f"📂 检测到目录查询意图，路径提示: [{_path or '顶级'}]")
-        reply_feishu_message(message_id, _list_kb_dir(_path))
-        return
+        return (_list_kb_dir(_path), [])
 
     # ====== 混合检索流程：ChromaDB 向量 + BM25 关键词 ======
     logger.info(f"🧠 [RAG] 开始检索知识库，关键词长度: {len(question)} 字符")
@@ -1106,8 +1099,7 @@ def process_and_reply(message_id, question, chat_id=None):
     valid_docs = [doc for doc, _ in valid_with_scores]
 
     if not valid_docs:
-        reply_feishu_message(message_id, "知识库中未找到符合条件的相关规定。您可以尝试放宽时间或目录限制，或回复 `/说明` 查看支持的检索功能。")
-        return
+        return ("知识库中未找到符合条件的相关规定。您可以尝试放宽时间或目录限制，或回复 `/说明` 查看支持的检索功能。", [])
 
     logger.info(f"📚 [RAG] 最终命中 {len(valid_docs)} 条，准备请求 LLM...")
 
@@ -1179,16 +1171,17 @@ def process_and_reply(message_id, question, chat_id=None):
 
     answer = clean_for_feishu(answer)
     write_qa_log(question, docs_and_scores, valid_with_scores, user_prompt, answer)
-    reply_feishu_with_images(message_id, answer, [], chat_id=chat_id)
+    return (answer, [])
 
 def _safe_process(message_id, question, chat_id=None):
-    """线程入口：限并发 + 整体兜底。检索/聚合等任一环节崩溃（如 HNSW 损坏）
+    """飞书线程入口：限并发 + 整体兜底。检索/聚合等任一环节崩溃（如 HNSW 损坏）
     都不再静默吞掉，用户至少能收到一条错误提示。"""
     with _worker_sem:
         try:
-            process_and_reply(message_id, question, chat_id)
+            text, images = answer_for(question)
+            reply_feishu_with_images(message_id, text, images, chat_id=chat_id)
         except Exception:
-            logger.exception("❌ process_and_reply 未捕获异常")
+            logger.exception("❌ answer_for 未捕获异常")
             try:
                 reply_feishu_message(message_id, "❌ 系统处理异常，请稍后重试；若持续出现请联系管理员查看日志。")
             except Exception:

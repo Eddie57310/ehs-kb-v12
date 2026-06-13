@@ -63,3 +63,9 @@ _preview_ehs.md
 
 # 系统文件
 .DS_Store
+
+# 企业微信运行日志
+wecom_run.log
+
+# 授权白名单（含成员 userid，人员数据不入库）
+authorized_users.json
