@@ -45,12 +45,17 @@ VOLCODING_API_KEY  = os.environ["VOLCODING_API_KEY"]
 VOLCODING_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
 VOLCODING_MODEL    = "doubao-seed-2.0-pro"   # 旗舰模型
 
+# DeepSeek 官方 API（OpenAI 兼容协议）
+DEEPSEEK_API_KEY  = os.environ["DEEPSEEK_API_KEY"]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL    = "deepseek-v4-pro"
+
 # 本地 Ollama（断网可用）
 LOCAL_LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
 
-# ================= 4. 动态状态机（默认火山旗舰）=================
-CURRENT_LLM   = "cloud"       # cloud | local
-CURRENT_MODEL = VOLCODING_MODEL
+# ================= 4. 动态状态机（默认 DeepSeek）=================
+CURRENT_LLM   = "deepseek"    # deepseek | cloud | local
+CURRENT_MODEL = DEEPSEEK_MODEL
 
 _token_cache = {"token": "", "expire": 0}
 _token_lock = threading.Lock()
@@ -530,6 +535,16 @@ _CONTROL_WORD_RE = re.compile(
     r'|\d{4}年(?:之后|以后|以来)'
 )
 
+# 用户要"完整/全文/逐条"原文、或问"十条/三宝/四口"这类**枚举式清单**时，答案常
+# 集中在一份文档（如十条措施散在十块、每块一条），而 top_k 只按相关度取前若干、
+# 每条措施单独成块分数中等，可能凑不齐。命中此意图 → 对主导文档整份按 chunk_seq
+# 带出，确保完整（见 answer_for 里的完整性聚合）。从 v11 移植(2026-06-18)。
+_COMPLETE_RE = re.compile(
+    r'完整(文字|内容|版本|版|的)?|全文|原文|逐条|逐项|完整列出|全部列出|每一?条'
+    r'|[一二三四五六七八九十百两\d]{1,3}\s*'
+    r'(条|大[类项]?|项|点|步|宝|口|管|红线|底线|纪律|措施|规定|禁令|严禁)'
+)
+
 _CN_NUM = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
            '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
 
@@ -569,7 +584,28 @@ def call_llm_engine(system_prompt: str, user_prompt: str):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            if llm == "cloud":
+            if llm == "deepseek":
+                headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+                payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096}
+                res = requests.post(DEEPSEEK_BASE_URL, headers=headers, json=payload, timeout=300)
+                if res.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"⚠️ 限流 429，等待 {wait}s 重试 ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                if res.status_code >= 500:
+                    logger.warning(f"⚠️ 服务端错误 {res.status_code}，重试 ({attempt+1}/{max_retries})")
+                    time.sleep(3)
+                    continue
+                try:
+                    data = res.json()
+                except Exception:
+                    raise Exception(f"DeepSeek API 返回非 JSON (HTTP {res.status_code}): {res.text[:200]}")
+                res.raise_for_status()
+                if "choices" not in data:
+                    raise Exception(f"DeepSeek API 返回异常: {data.get('error', data.get('message', '未知'))}")
+                return data["choices"][0]["message"]["content"]
+            elif llm == "cloud":
                 headers = {"Authorization": f"Bearer {VOLCODING_API_KEY}", "Content-Type": "application/json"}
                 payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096}
                 res = requests.post(VOLCODING_BASE_URL, headers=headers, json=payload, timeout=300)
@@ -799,21 +835,15 @@ def answer_for(question, asker=""):
             with _state_lock:
                 status_msg  = "🤖 **智慧工地 EHS + 专业部门知识大脑**\n"
                 status_msg += "⚠️ 思考上限5分钟，请排队提问 | `/说明` 查看此菜单\n"
-                status_msg += "📂 **公开库**：EHS案例 / 公司内部 / 国家规定\n"
-                status_msg += "🔒 **封闭库**（须在提问中明确写出部门名称才会检索）：\n"
-                status_msg += "   客关部（排雷库、规定）/ 设计部（惊喜库、用心库、沧海桑田）\n"
-                status_msg += "   工管部（工艺标准、案例集）/ 合约部（缺陷案例）\n"
+                status_msg += "📂 **公开库**：公司内部 / 国家规定\n"
+                status_msg += "🔒 **封闭库**（须在提问中明确写出名称才会检索）：\n"
+                status_msg += "   EHS案例（须写「案例」才检索）\n"
                 status_msg += "---\n"
                 status_msg += "**📂 【技能1：锁定搜索范围】**\n"
                 status_msg += "提问时带入以下关键词，系统会严格限定在对应范围内检索：\n"
-                status_msg += "• 「**EHS案例**」→ 仅在 EHS 案例库中搜索\n"
+                status_msg += "• 「**案例**」/「**EHS案例**」→ 仅在 EHS 案例库中搜索（不写则不返回案例）\n"
                 status_msg += "• 「**公司内部**」→ 仅在公司内部制度中搜索\n"
-                status_msg += "• 「**国家规定**」→ 仅在国家法规标准库中搜索\n"
-                status_msg += "• 「**客关部**」→ 仅在客关部封闭库中搜索（排雷库等）\n"
-                status_msg += "• 「**设计部**」→ 仅在设计部封闭库中搜索（惊喜库/用心库/沧海桑田）\n"
-                status_msg += "• 「**工管部**」→ 仅在工管部封闭库中搜索\n"
-                status_msg += "• 「**合约部**」→ 仅在合约部封闭库中搜索\n"
-                status_msg += "⚠️ 封闭库须写**完整部门名**（如「客关部」），写「客关」不会触发\n\n"
+                status_msg += "• 「**国家规定**」→ 仅在国家法规标准库中搜索\n\n"
                 status_msg += "**⏱️ 【技能2：时间过滤】**\n"
                 status_msg += "提问中加入「近三年」「近五年」或具体年份（如2024年）\n\n"
                 status_msg += "**📝 【技能3：引用来源 / 案例分析模式】**\n"
@@ -838,8 +868,7 @@ def answer_for(question, asker=""):
                 status_msg += "✅ 「应知应会手册中1+N+4+N体系是什么意思」\n"
                 status_msg += "✅ 「管理十条：项目总经理对安全事故需承担哪些责任。开启分析」\n"
                 status_msg += "✅ 「脚手架搭设有哪些强制性要求 国家规定 精准匹配」\n"
-                status_msg += "✅ 「客关部 排雷库中有哪些泳池相关注意事项」\n"
-                status_msg += "✅ 「设计部 惊喜库有多少案例」\n"
+                status_msg += "✅ 「三宝四口的案例有哪些」\n"
                 status_msg += "✅ 「近三年关于承包商安全管理有哪些新要求？宽松匹配 开启分析」\n"
                 status_msg += "✅ 「真实案例分析 ...案例描述文字...该如何界定责任？」"
 
@@ -856,8 +885,8 @@ def answer_for(question, asker=""):
             return (f"🤫 已切换至火山引擎旗舰 ({VOLCODING_MODEL})。", [])
         elif cmd == "/唤醒v4":
             with _state_lock:
-                CURRENT_LLM, CURRENT_MODEL = "cloud", "ark-code-latest"  # DeepSeek-V4-Pro-Beta
-            return ("🤫 已切换至 DeepSeek-V4-Pro（尝鲜版，遇限流请切回 /唤醒火山）。", [])
+                CURRENT_LLM, CURRENT_MODEL = "deepseek", DEEPSEEK_MODEL
+            return (f"🤫 已切换至 DeepSeek 官方 ({DEEPSEEK_MODEL})。", [])
         elif cmd == "/唤醒深海":
             with _state_lock:
                 CURRENT_LLM, CURRENT_MODEL = "local", "deepseek-r1:32b"
@@ -903,10 +932,10 @@ def answer_for(question, asker=""):
 
     # ── domain 级路由 ──
     domain_keywords = {
-        # EHS案例
-        "EHS案例": "EHS案例", "负面案例": "EHS案例", "正面案例": "EHS案例",
-        "案例库": "EHS案例", "警示手册": "EHS案例", "标准化手册": "EHS案例",
-        "事故案例": "EHS案例",
+        # EHS案例（封闭库：提问须含"案例"等词才检索，否则不返回案例内容）
+        "案例": "EHS案例", "EHS案例": "EHS案例", "负面案例": "EHS案例",
+        "正面案例": "EHS案例", "案例库": "EHS案例", "警示手册": "EHS案例",
+        "标准化手册": "EHS案例", "事故案例": "EHS案例",
         # 公司内部
         "公司内部": "公司内部", "内部制度": "公司内部", "内部规定": "公司内部",
         "公司规定": "公司内部", "公司制度": "公司内部", "内部文件": "公司内部",
@@ -914,17 +943,12 @@ def answer_for(question, asker=""):
         # 国家规定
         "国家规定": "国家规定", "法律法规": "国家规定", "国家标准": "国家规定",
         "行业标准": "国家规定", "国家法规": "国家规定", "法规标准": "国家规定",
-        # 设计部
-        "设计部": "设计部",
-        # 客关部
-        "客关部": "客关部",
-        # 工管部
-        "工管部": "工管部",
-        # 合约部
-        "合约部": "合约部",
     }
-    # 封闭域：必须显式提到才搜索，通用问题不搜
-    EXCLUSIVE_DOMAINS = {"设计部", "客关部", "工管部", "合约部"}
+    # 封闭域：必须显式提到才搜索，通用问题不搜。
+    #   EHS案例 收进封闭库——案例文件块多、面包屑同质，会把通用提问的命中刷满；
+    #   要看案例须在提问里写"案例"等词（事故分析模式例外，见下方放行）。
+    #   本库无 设计部/客关部/工管部/合约部 数据，故封闭库只剩 EHS案例。
+    EXCLUSIVE_DOMAINS = {"EHS案例"}
 
     # ── scope 关键词：硬编码 + 从目录自动提取 ──
     _hardcoded_scope = [
@@ -944,6 +968,10 @@ def answer_for(question, asker=""):
     for kw, dm in domain_keywords.items():
         if kw in question:
             detected_domains.add(dm)
+    # "真实案例分析…"天然含"案例"二字，但事故模式要跨域(公司内部+国家规定+案例先例)
+    # 检索，不能被"案例"误锁进 EHS案例 单域 → 去掉该限定，改由 _passes_filter 放行。
+    if is_accident_mode:
+        detected_domains.discard("EHS案例")
 
     # domain 和 scope 可叠加
     detected_scope = None
@@ -1001,7 +1029,9 @@ def answer_for(question, asker=""):
                 return False
         else:
             if doc_domain in EXCLUSIVE_DOMAINS:
-                return False
+                # 事故分析模式默认放行 EHS案例（找相似先例）；其余封闭部门库仍排除
+                if not (is_accident_mode and doc_domain == "EHS案例"):
+                    return False
         if detected_scope:
             if detected_scope not in meta.get('source', ''):
                 return False
@@ -1103,6 +1133,41 @@ def answer_for(question, asker=""):
         valid_with_scores = aggregated + kept
         logger.info(f"📑 索引聚合: {list(index_srcs)} → 整份带出 {len(aggregated)} 块，合计 {len(valid_with_scores)} 块")
     has_index_aggregation = bool(index_srcs)
+
+    # ── 完整性聚合（从 v11 移植 2026-06-18）：用户要"完整/全文/逐条"或问"十条/三宝/
+    #   四口"等枚举清单时，答案常集中在一份文档，但 top_k 按相关度只取前若干、每条
+    #   单独成块分数中等，会凑不齐 → 挑命中块里贡献最多的源，按 chunk_seq 整份带出置前。
+    #   注：v12 无 scored_all（旧检索），改从已过 reranker 门槛的 valid_with_scores 里
+    #   统计主导源（比从未精排的 filtered 里数更稳，不会被松过滤进来的无关大文档带偏）。──
+    if _COMPLETE_RE.search(question) and not is_accident_mode and valid_with_scores:
+        base_cnt, base_best, base_concrete = {}, {}, {}
+        for doc, rel in valid_with_scores:
+            s = doc.metadata.get('source', '')
+            b = re.sub(r'\.(pdf|md)$', '', s)
+            base_cnt[b] = base_cnt.get(b, 0) + 1
+            if isinstance(rel, float) and (b not in base_best or rel > base_best[b]):
+                base_best[b] = rel
+            if b not in base_concrete or s.endswith('.md'):
+                base_concrete[b] = s
+        if base_cnt:
+            target_base = max(base_cnt, key=lambda b: (base_cnt[b], base_best.get(b, 0.0)))
+            # 仅当该源在命中里贡献≥2块（值得整份带出）且非索引文件才聚合
+            if base_cnt[target_base] >= 2 and target_base not in index_srcs:
+                target_src = base_concrete[target_base]
+                full = db.get(where={'source': target_src},
+                              include=['documents', 'metadatas'])
+                if full and full.get('documents'):
+                    blocks = sorted(zip(full['documents'], full['metadatas']),
+                                    key=lambda x: x[1].get('chunk_seq', 0))
+                    agg_score = base_best.get(target_base, 1.0)
+                    agg = [(_LCDoc(page_content=c, metadata=m), agg_score)
+                           for c, m in blocks]
+                    rest = [(d, s) for d, s in valid_with_scores
+                            if re.sub(r'\.(pdf|md)$', '',
+                                      d.metadata.get('source', '')) != target_base]
+                    valid_with_scores = agg + rest
+                    logger.info(f"📖 完整性聚合: {target_src} → 整份带出 "
+                                f"{len(agg)} 块，合计 {len(valid_with_scores)} 块")
 
     valid_docs = [doc for doc, _ in valid_with_scores]
 
