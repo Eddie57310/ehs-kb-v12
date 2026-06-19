@@ -80,6 +80,45 @@ def _extract_time(filename: str, rel_path: str):
     return 946684800, "2000-01-01"
 
 
+# ── 列表截断兜底 ──────────────────────────────────────────
+# 相邻块若是从编号列表中间被切开的（前块以列表项 N 结尾、后块以列表项 N+1 开头），
+# 合并回去。无论切断原因（标题误判 / 超长 size 切分）一律还原，覆盖“列表游程保护”意图。
+
+_LIST_ITEM_RE = re.compile(r'^(\d{1,2})\s+\S')   # 行首“裸数字+空格+内容”=列表项；带点(5.1.6)/表格(|)不算
+
+def _merge_split_enumerations(chunks: list[str]) -> list[str]:
+    def _last_item(text):
+        for ln in reversed(text.splitlines()):
+            if ln.strip():
+                m = _LIST_ITEM_RE.match(ln.strip())
+                return int(m.group(1)) if m else None
+        return None
+
+    def _first_item(text):
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines) and (not lines[i].strip() or
+              (lines[i].strip().startswith('【') and lines[i].strip().endswith('】'))):
+            i += 1
+        if i < len(lines):
+            m = _LIST_ITEM_RE.match(lines[i].strip())
+            if m:
+                return int(m.group(1)), '\n'.join(lines[i:])
+        return None, text
+
+    if len(chunks) < 2:
+        return chunks
+    out = [chunks[0]]
+    for cur in chunks[1:]:
+        ln = _last_item(out[-1])
+        fn, body = _first_item(cur)
+        if ln is not None and fn is not None and fn == ln + 1:
+            out[-1] = out[-1].rstrip() + '\n' + body     # 去掉后块面包屑前缀，拼回前块
+        else:
+            out.append(cur)
+    return out
+
+
 # ── 章节感知切块（复用 sync_kb 逻辑）────────────────────────
 
 def _structured_chunks(md_content: str, max_size: int = CHUNK_SIZE) -> list[str]:
@@ -89,6 +128,8 @@ def _structured_chunks(md_content: str, max_size: int = CHUNK_SIZE) -> list[str]
         separators=["\n\n", "\n", "。", "；", "，", " "],
     )
     md_re  = re.compile(r'^(#{1,6})\s+(.+)$')
+    # 数字编号标题：裸数字章节号(1 总则)与多级(5.1.5)都认；但标题以句末标点(。；，、)结尾的
+    # 一律当正文——那是列表项/句子(如“10 六级或六级以上强风。”)，否则会把清单从中间切断。
     num_re = re.compile(
         r'^(\d+(?:\.\d+)*)\s+([A-Za-z\u4e00-\u9fa5][\u4e00-\u9fa5\w\s（）【】、，。：:]{1,60})\s*$'
     )
@@ -99,8 +140,11 @@ def _structured_chunks(md_content: str, max_size: int = CHUNK_SIZE) -> list[str]
             return len(m.group(1)), m.group(2).strip()
         m = num_re.match(line)
         if m:
+            title = m.group(2).strip()
+            if title and title[-1] in '。；，、':     # 句末标点结尾 → 列表项/句子，非标题
+                return None
             num = m.group(1)
-            return num.count('.') + 1, f"{num} {m.group(2).strip()}"
+            return num.count('.') + 1, f"{num} {title}"
         return None
 
     stack: list[tuple[int, str]] = []
@@ -132,6 +176,7 @@ def _structured_chunks(md_content: str, max_size: int = CHUNK_SIZE) -> list[str]
             body.append(line)
     _flush()
 
+    chunks = _merge_split_enumerations(chunks)
     return chunks if chunks else _sub.split_text(md_content)
 
 

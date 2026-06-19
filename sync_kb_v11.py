@@ -301,6 +301,7 @@ def extract_pdf_structured_chunks(md_content: str, max_size: int = 800) -> list[
     )
 
     md_heading_re  = re.compile(r'^(#{1,6})\s+(.+)$')
+    # 数字编号标题：裸数字(1 总则)与多级(5.1.5)都认；标题以句末标点(。；，、)结尾的当正文(列表项/句子)
     num_heading_re = re.compile(r'^(\d+(?:\.\d+)*)\s+([A-Za-z\u4e00-\u9fa5][\u4e00-\u9fa5\w\s（）【】、，。：:]{1,60})\s*$')
 
     def _detect_heading(line):
@@ -309,8 +310,11 @@ def extract_pdf_structured_chunks(md_content: str, max_size: int = 800) -> list[
             return len(m.group(1)), m.group(2).strip()
         m = num_heading_re.match(line)
         if m:
+            t = m.group(2).strip()
+            if t and t[-1] in '。；，、':      # 句末标点结尾 → 列表项/句子，非标题
+                return None
             num   = m.group(1)
-            title = f"{num} {m.group(2).strip()}"
+            title = f"{num} {t}"
             level = num.count('.') + 1
             return level, title
         return None
