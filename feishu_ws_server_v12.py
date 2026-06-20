@@ -53,6 +53,10 @@ DEEPSEEK_MODEL    = "deepseek-v4-pro"
 # 本地 Ollama（断网可用）
 LOCAL_LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
 
+# 检索增强开关：检索前用 LLM 把提问展开/改写（治"提问用简称、文档用全称"的召回漏洞）
+ENABLE_QUERY_EXPANSION = True
+QUERY_EXPANSION_N      = 3      # 每次最多生成的扩展 query 条数
+
 # ================= 4. 动态状态机（默认 DeepSeek）=================
 CURRENT_LLM   = "deepseek"    # deepseek | cloud | local
 CURRENT_MODEL = DEEPSEEK_MODEL
@@ -231,42 +235,119 @@ def _rrf_merge(chroma_res: list, bm25_res: list, rrf_k: int = 60) -> list:
         rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (rrf_k + rank + 1)
         if key not in doc_map:
             doc_map[key]       = doc
-            chroma_scores[key] = 0.6   # BM25-only命中，给一个通过阈值的默认分
+            chroma_scores[key] = None  # BM25-only命中：无向量距离，交由 reranker 裁决
 
     merged = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
     return [(doc_map[k], chroma_scores[k]) for k in merged]
 
-# ── Reranker（二阶段精排）────────────────────────────────
-try:
-    from FlagEmbedding import FlagReranker
-    _reranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=False)  # CPU 下 fp16 反而更慢
-    logger.info("✅ Reranker (bge-reranker-v2-m3) 加载完毕")
-    _RERANKER_READY = True
-except Exception as e:
-    _reranker = None
-    _RERANKER_READY = False
-    logger.warning(f"⚠️ Reranker 未加载: {e}")
+# ── Reranker：改用共享 GPU 服务 rerank_server.py，本地不再加载模型（省显存）──
+import urllib.request as _urlreq
+RERANK_URL = os.environ.get("RERANK_URL", "http://127.0.0.1:8765/rerank")
+_reranker = None
+_RERANKER_READY = True   # 精排走远程服务；远程不可达时 _rerank_all 自动降级为融合排序
 
-def _rerank(question: str, candidates: list, top_k: int = 10, min_score: float = 0.05) -> list:
-    """用 cross-encoder 精排，返回 top_k 条 (doc, original_score)。
-    min_score：rerank 归一化分（0~1）门槛，低于此分的候选视为弱相关直接淘汰，
-    避免 top_k 永远填满导致无关内容硬塞进 prompt。"""
-    if not _RERANKER_READY or not candidates:
-        return candidates[:top_k]
+def _remote_rerank(question: str, docs: list, timeout: float = 180):
+    """调用共享 rerank 服务，返回与 docs 等长的分数列表；失败返回 None。"""
+    if not docs:
+        return []
     try:
-        pairs  = [[question, doc.page_content] for doc, _ in candidates]
-        scores = _reranker.compute_score(pairs, normalize=True)
-        if isinstance(scores, float):  # 单候选时 FlagReranker 返回标量
-            scores = [scores]
-        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-        kept    = [(item, s) for item, s in ranked[:top_k] if s >= min_score]
-        dropped = min(len(ranked), top_k) - len(kept)
-        if dropped:
-            logger.info(f"  🎯 Rerank 门槛({min_score})淘汰 {dropped} 条弱相关候选")
-        return [item for item, _ in kept]
+        body = json.dumps({"question": question, "docs": docs}).encode()
+        req  = _urlreq.Request(RERANK_URL, data=body,
+                               headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read()).get("scores")
+    except Exception as e:
+        logger.warning(f"⚠️ 远程 rerank 失败({e})，降级为融合排序")
+        return None
+
+try:
+    with _urlreq.urlopen(RERANK_URL.replace("/rerank", "/health"), timeout=5) as _r:
+        _h = json.loads(_r.read())
+    logger.info(f"✅ 共享 rerank 服务可用: {RERANK_URL} (device={_h.get('device')})")
+except Exception as _e:
+    logger.warning(f"⚠️ 共享 rerank 服务暂不可达({_e})；精排将降级，请确认 rerank_server 已启动")
+
+def _rerank_all(question: str, candidates: list) -> list:
+    """给全部候选打 cross-encoder 相关度分，返回 [(doc, dist, rel), ...] 按 rel 降序。不截断。
+    candidates: [(doc, dist_or_None)]；reranker 不可用时 rel 置 None、保持原序。"""
+    if not candidates:
+        return []
+    if not _RERANKER_READY:
+        return [(doc, dist, None) for doc, dist in candidates]
+    try:
+        docs   = [doc.page_content for doc, _ in candidates]
+        scores = _remote_rerank(question, docs)
+        if scores is None or len(scores) != len(candidates):
+            return [(doc, dist, None) for doc, dist in candidates]
+        trip = [(doc, dist, float(s)) for (doc, dist), s in zip(candidates, scores)]
+        trip.sort(key=lambda x: x[2], reverse=True)
+        return trip
     except Exception as e:
         logger.warning(f"⚠️ Reranker 精排失败，降级: {e}")
-        return candidates[:top_k]
+        return [(doc, dist, None) for doc, dist in candidates]
+
+def _rerank(question: str, candidates: list, top_k: int = 10, min_score: float = 0.05) -> list:
+    """精排 + 门槛 + 截断，返回 top_k 条 (doc, rel_score)。"""
+    trip = _rerank_all(question, candidates)
+    if not _RERANKER_READY:
+        return [(doc, None) for doc, _d, _r in trip[:top_k]]
+    kept    = [(doc, rel) for doc, _d, rel in trip[:top_k] if rel is not None and rel >= min_score]
+    dropped = min(len(trip), top_k) - len(kept)
+    if dropped:
+        logger.info(f"  🎯 Rerank 门槛({min_score})淘汰 {dropped} 条弱相关候选")
+    return kept
+
+
+def _select_top(scored_all: list, top_k: int, floor: float):
+    """从按相关度降序的 scored_all=[(doc,dist,rel)] 里取 floor 以上的前 top_k。
+    （原方案③还叠"单源名额上限"防案例库面包屑刷屏，已废弃删除——刷屏靠入库质量治本。）
+    floor 以下（已降序）即停。返回 [(doc, rel)]。"""
+    out = []
+    for doc, _dist, rel in scored_all:
+        if rel is None or rel < floor:
+            break
+        out.append((doc, rel))
+        if len(out) >= top_k:
+            break
+    return out
+
+
+def _fallback_by_distance(scored_all: list, top_k: int) -> list:
+    """Reranker 运行时失败（rel 全 None）时，按向量距离升序取 top_k，BM25-only 置后。"""
+    by_dist = sorted(scored_all, key=lambda x: (x[1] is None, x[1] if x[1] is not None else 999.0))
+    return [(doc, dist) for doc, dist, _r in by_dist[:top_k]]
+
+
+_EXPAND_SYS = "你是知识库检索改写助手。只输出用于检索的词句，不解释、不寒暄。"
+
+def _expand_query(query: str, n: int = QUERY_EXPANSION_N) -> list:
+    """用 LLM 把提问展开/改写为若干检索 query，提升召回（fail-open，失败返回 []）。
+    相关度最终仍由 reranker 对【原始问题】裁决，跑偏的扩展只会被滤掉、不伤精度。"""
+    if not query.strip():
+        return []
+    prompt = (
+        f"原始提问：{query}\n\n"
+        f"请生成用于知识库检索的改写，目标是提高召回：\n"
+        f"1) 若提问含专业简称/行话/缩写，展开为全称或等价说法"
+        f"（例：把『三宝』展开为『安全帽 安全网 安全带』，把『四口』展开为『楼梯口 通道口 预留洞口 电梯井口』）；\n"
+        f"2) 用一句话写出该问题最可能的标准答案（假设性答案，用于语义检索）。\n"
+        f"每行一条，最多 {n} 条，只输出检索用的词句本身，不要编号、不要解释。"
+    )
+    try:
+        raw = call_llm_engine(_EXPAND_SYS, prompt)
+    except Exception as e:
+        logger.warning(f"⚠️ 查询扩展失败，降级用原查询: {e}")
+        return []
+    out = []
+    for ln in (raw or "").splitlines():
+        ln = re.sub(r'^[\s\-—·•\d\.、,，）)\]】]+', '', ln).strip()
+        if ln and ln != query and ln not in out:
+            out.append(ln)
+        if len(out) >= n:
+            break
+    if out:
+        logger.info(f"🪄 查询扩展({len(out)}): {out}")
+    return out
 
 # ── scope_keywords 从 Local_KB 目录自动提取 ──────────────
 def _build_scope_keywords() -> list[str]:
@@ -772,15 +853,20 @@ def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, p
         f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"问题: {question}",
         "",
-        f"=== 全部候选（k=20，共 {len(all_candidates)} 条）===",
+        f"=== 全部候选（reranker 相关度降序，共 {len(all_candidates)} 条）===",
     ]
-    for i, (doc, score) in enumerate(all_candidates, 1):
+    for i, item in enumerate(all_candidates, 1):
+        doc  = item[0]
+        rel  = item[2] if len(item) >= 3 else item[1]   # rel=相关度(0~1越高越相关)
+        dist = item[1] if len(item) >= 3 else None       # dist=向量距离(越低越近，None=纯BM25)
+        rel_s  = f"相关度:{rel:.4f}" if isinstance(rel, float) else "相关度:NA"
+        dist_s = f"  距离:{dist:.4f}" if isinstance(dist, float) else "  (BM25命中)"
         src    = doc.metadata.get('source', '未知')
         date_s = doc.metadata.get('date_str', '未知')
         domain = doc.metadata.get('domain', '未知')
         lines += [
             "",
-            f"[{i:02d}] 得分:{score:.4f}  domain:{domain}  日期:{date_s}",
+            f"[{i:02d}] {rel_s}{dist_s}  domain:{domain}  日期:{date_s}",
             f"     来源: {src}",
             "--- 内容 ---",
             doc.page_content,
@@ -789,14 +875,15 @@ def write_qa_log(question: str, all_candidates: list, valid_with_scores: list, p
 
     lines += [
         "",
-        f"=== 命中块（阈值过滤后，共 {len(valid_with_scores)} 条）===",
+        f"=== 命中块（rerank 门槛过滤后，共 {len(valid_with_scores)} 条）===",
     ]
     for i, (doc, score) in enumerate(valid_with_scores, 1):
         src    = doc.metadata.get('source', '未知')
         date_s = doc.metadata.get('date_str', '未知')
+        score_s = f"相关度:{score:.4f}" if isinstance(score, float) else "相关度:NA"
         lines += [
             "",
-            f"【{i}】得分:{score:.4f}  日期:{date_s}",
+            f"【{i}】{score_s}  日期:{date_s}",
             f"    来源: {src}",
             "--- 内容 ---",
             doc.page_content,
@@ -1057,31 +1144,73 @@ def answer_for(question, asker=""):
         tag += f" scope={detected_scope}" if detected_scope else ""
         logger.info(f"🎯 定向过滤: [{tag.strip()}]")
 
-    # ── 向量检索 + BM25 混合（scope 是检索后过滤，命中 scope 时加大候选量）──
+    # ── 多路 query 召回：原查询 + LLM 扩展查询，各跑 向量 + BM25，候选取并集 ──
     retrieval_k = 30 if detected_scope else 20
-    chroma_res = db.similarity_search_with_score(retrieval_query, k=retrieval_k, filter=chroma_where)
-    bm25_res   = _bm25_search(retrieval_query, k=retrieval_k, predicate=_passes_filter)
-    docs_and_scores = _rrf_merge(chroma_res, bm25_res) if bm25_res else chroma_res
-    logger.info(f"🔀 RRF 合并后候选: {len(docs_and_scores)} 条")
+    queries = [retrieval_query]
+    if ENABLE_QUERY_EXPANSION:
+        queries += _expand_query(retrieval_query)
 
-    filtered = [(doc, score) for doc, score in docs_and_scores
-                if _passes_filter(doc) and score < score_threshold]
+    pool = {}          # key -> (doc, best_dist)；best_dist=None 表示纯 BM25 命中
+    chroma_res = []    # 仅留原查询的向量结果，用于下方诊断日志
+    for qi, q in enumerate(queries):
+        try:
+            cres = db.similarity_search_with_score(q, k=retrieval_k, filter=chroma_where)
+        except Exception as e:
+            logger.warning(f"⚠️ 向量检索失败(query='{q[:20]}'): {e}")
+            cres = []
+        bres = _bm25_search(q, k=retrieval_k, predicate=_passes_filter)
+        if qi == 0:
+            chroma_res = cres
+        for doc, dist in cres:
+            key = doc.metadata.get('source', '') + '§' + doc.page_content[:80]
+            cur = pool.get(key)
+            if cur is None or cur[1] is None or dist < cur[1]:
+                pool[key] = (doc, dist)
+        for doc, _bm in bres:
+            key = doc.metadata.get('source', '') + '§' + doc.page_content[:80]
+            if key not in pool:
+                pool[key] = (doc, None)
+
+    docs_and_scores = list(pool.values())
+    logger.info(f"🔀 {len(queries)} 路 query 合并后候选: {len(docs_and_scores)} 条")
 
     for doc, score in chroma_res[:5]:
-        logger.info(f"  📊 向量得分: {score:.4f} | {doc.metadata.get('source','未知')}")
+        logger.info(f"  📊 向量距离: {score:.4f} | {doc.metadata.get('source','未知')}")
 
-    # ── Reranker 精排 → top8（普通模式）/ top15（事故模式）──
-    top_k = accident_top_k if is_accident_mode else 8
-    reranked = _rerank(retrieval_query, filtered, top_k=top_k, min_score=rerank_floor)
-    valid_with_scores = reranked
+    # ── 候选过滤：仅 domain/scope/时间；不再用原始向量距离预筛（会在 rerank 前砍掉
+    #    dense 边缘但实际相关的定义块）。距离上限仅在用户显式「阈值 X」时保留。──
+    candidates = [(doc, dist) for doc, dist in docs_and_scores if _passes_filter(doc)]
+    if _tm:
+        candidates = [(doc, dist) for doc, dist in candidates
+                      if dist is None or dist < score_threshold]
 
-    if not valid_with_scores and use_fallback:
-        # 兜底：放宽距离阈值，但仍保持封闭域/时间过滤，rerank 门槛不放
-        all_filtered = [(doc, score) for doc, score in docs_and_scores if _passes_filter(doc)]
-        valid_with_scores = _rerank(retrieval_query, all_filtered, top_k=top_k, min_score=rerank_floor)
+    # ── Reranker 精排：对【原始问题】打分，是唯一相关度门槛 ──
+    top_k = accident_top_k if is_accident_mode else 20
+    scored_all = _rerank_all(retrieval_query, candidates)
+    if _RERANKER_READY:
+        valid_with_scores = _select_top(scored_all, top_k, rerank_floor)
+        if not valid_with_scores and scored_all and scored_all[0][2] is None:
+            valid_with_scores = _fallback_by_distance(scored_all, top_k)
+            logger.warning(f"  ⚠️ Reranker 运行时降级，按向量距离取 {len(valid_with_scores)} 块")
+        logger.info(f"  🎯 命中 {len(valid_with_scores)} 块 (floor={rerank_floor})")
+    else:
+        valid_with_scores = [(doc, dist) for doc, dist, _r in scored_all[:top_k]]
 
-    if not valid_with_scores and docs_and_scores:
-        logger.info(f"  ℹ️  阈值过滤后为空，最近得分: {docs_and_scores[0][1]:.4f}，不兜底")
+    if not valid_with_scores and _tm and use_fallback:
+        # 仅自定义阈值把候选清空时兜底：去掉距离上限重排一次
+        wide = [(doc, dist) for doc, dist in docs_and_scores if _passes_filter(doc)]
+        scored_all = _rerank_all(retrieval_query, wide)
+        if _RERANKER_READY:
+            valid_with_scores = _select_top(scored_all, top_k, rerank_floor)
+            if not valid_with_scores and scored_all and scored_all[0][2] is None:
+                valid_with_scores = _fallback_by_distance(scored_all, top_k)
+        else:
+            valid_with_scores = [(doc, dist) for doc, dist, _r in scored_all[:top_k]]
+
+    if not valid_with_scores and scored_all:
+        _best = scored_all[0][2]
+        _best_s = f"{_best:.4f}" if isinstance(_best, float) else "NA"
+        logger.info(f"  ℹ️  rerank 门槛后为空，最高相关度: {_best_s}")
 
     # ── 事故模式：追加国家规定法律条款检索 ──
     if is_accident_mode:
@@ -1206,11 +1335,20 @@ def answer_for(question, asker=""):
         '不要仅凭正文案例卡片片段来估算总数。\n'
     ) if has_index_aggregation else ""
 
+    def_hint = (
+        "【定义块优先】当问题询问某概念/清单/条目的具体内容（如“十不吊”“三宝四口”"
+        "“主要风险”等）时，优先采用逐条列出该项具体内容的参考资料（含编号列表、"
+        "逐条释义的条文块），而非仅一句话提及该项名称的管理/检查表类资料。"
+        "若标准把同类事项分成“主要”与“其他”等子类，回答排序以标准自身表述为准，"
+        "不要把条目编号当优先级。\n"
+    )
+
     if is_accident_mode or "开启分析" in question:
         user_prompt = (
             f"参考资料如下：\n{context_str}\n\n"
             f"问题：{question}\n"
             f"{index_hint}"
+            f"{def_hint}"
             f"{img_instruction}"
             f"请筛选与问题直接相关的参考资料，整合分析并给出结论。"
             f"与问题无关的参考资料不要引入答案。"
@@ -1222,6 +1360,7 @@ def answer_for(question, asker=""):
             f"参考资料如下：\n{context_str}\n\n"
             f"问题：{question}\n"
             f"{index_hint}"
+            f"{def_hint}"
             f"{img_instruction}"
             f"请先判断哪些参考资料与问题直接相关，只基于直接相关的部分作答，"
             f"不相关的内容不要引入答案。"
@@ -1243,7 +1382,7 @@ def answer_for(question, asker=""):
         answer = f"❌ 响应失败: {str(e)}"
 
     answer = clean_for_feishu(answer)
-    write_qa_log(question, docs_and_scores, valid_with_scores, user_prompt, answer, asker=asker)
+    write_qa_log(question, scored_all, valid_with_scores, user_prompt, answer, asker=asker)
     return (answer, [])
 
 # ================= 私聊白名单 + 用户名查询 + 全量问答记录 =================
